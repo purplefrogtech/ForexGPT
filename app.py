@@ -4,7 +4,7 @@ import aiohttp
 import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
-from typing import Tuple, Dict, Optional, List
+from typing import Tuple, Dict, Optional
 
 import pandas as pd
 import numpy as np
@@ -22,6 +22,11 @@ load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 API_KEY = os.getenv("ALPHAVANTAGE_API_KEY")
 
+if not TOKEN:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN missing in .env")
+if not API_KEY:
+    raise RuntimeError("ALPHAVANTAGE_API_KEY missing in .env")
+
 AUTH_STR = os.getenv("AUTHORIZED_USERS", "")
 AUTHORIZED_USERS = {s.strip() for s in AUTH_STR.split(",") if s.strip()}
 
@@ -29,11 +34,10 @@ DEFAULT_PAIRS = [p.strip().upper() for p in os.getenv("DEFAULT_PAIRS", "EURUSD,U
 DEFAULT_TERMS = [t.strip() for t in os.getenv("DEFAULT_TERMS", "kısa,orta").split(",") if t.strip()]
 SCAN_INTERVAL_SEC = int(os.getenv("SCAN_INTERVAL_SEC", "120"))
 SIGNAL_COOLDOWN_MIN = int(os.getenv("SIGNAL_COOLDOWN_MIN", "15"))
-ENABLE_CHARTS = os.getenv("ENABLE_CHARTS", "False").lower() == "true"
 
 BASE_URL = "https://www.alphavantage.co/query"
 CACHE_TTL = timedelta(minutes=10)
-API_CONCURRENCY = asyncio.Semaphore(1)  # AV free: 5 req/dk → tek uçuş
+API_CONCURRENCY = asyncio.Semaphore(1)  # Alpha Vantage free tier için tek uçuş
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("forexgpt")
@@ -43,7 +47,7 @@ CACHE: Dict[str, Tuple[datetime, dict]] = {}
 
 # kalıcı dosyalar
 SUBSCRIBERS_FILE = "subscribers.json"  # { "chat_ids": [int,...] }
-STATE_FILE = "state.json"              # { "PAIR|TERM": {"last_signal": "...", "last_ts": "...", "last_push":"..."} }
+STATE_FILE = "state.json"              # { "PAIR|TERM": {"last_signal": "...", "last_ts": "...", "last_push":"...", "history":[...]} }
 
 # ─────────── I18N ───────────
 def i18n(lang: str) -> Dict[str, str]:
@@ -70,7 +74,6 @@ def i18n(lang: str) -> Dict[str, str]:
     }
     if lang == "tr":
         return tr
-    # EN
     return {
         "choose_lang": "Please select a language:",
         "lang_set_tr": "Language set to Turkish.",
@@ -98,11 +101,7 @@ def is_user_authorized(update: Update) -> bool:
     user = update.effective_user
     ident = str(user.id)
     uname = f"@{user.username}" if user and user.username else None
-    if ident in AUTHORIZED_USERS:
-        return True
-    if uname and uname in AUTHORIZED_USERS:
-        return True
-    return False
+    return ident in AUTHORIZED_USERS or (uname and uname in AUTHORIZED_USERS)
 
 def parse_pair(text: str) -> Optional[Tuple[str, str]]:
     t = (text or "").upper().strip().replace(" ", "")
@@ -125,36 +124,41 @@ def save_json(path: str, data):
 
 # ─────────── API & Indicators ───────────
 async def fetch_json(params: dict, cache_key: str, retry: int = 2) -> dict:
-    # cache
+    """Alpha Vantage çağrısı: rate-limit/uyarı/hata gövdelerini cache'leme; yalnızca sağlıklı veriyi cache'le."""
     now = datetime.now(timezone.utc)
     hit = CACHE.get(cache_key)
     if hit and hit[0] > now:
         return hit[1]
 
     async with API_CONCURRENCY:
-        backoff = 2
-        for attempt in range(retry + 1):
-            async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession() as session:
+            backoff = 2
+            for attempt in range(retry + 1):
                 async with session.get(BASE_URL, params=params, timeout=30) as resp:
                     if resp.status != 200:
                         if attempt < retry:
-                            await asyncio.sleep(backoff); backoff *= 2; continue
+                            await asyncio.sleep(backoff); backoff *= 2
+                            continue
                         raise ValueError(f"HTTP {resp.status}")
                     data = await resp.json()
 
-            if "Note" in data:
-                wait_for = 12
-                logger.warning("Rate limited; waiting %ss", wait_for)
-                await asyncio.sleep(wait_for)
-                if attempt < retry: continue
+                # Geçersiz sembol/parametre
+                if "Error Message" in data:
+                    raise ValueError(data["Error Message"])
 
-            if "Error Message" in data:
-                raise ValueError(data["Error Message"])
+                # Rate limit / bilgi mesajları
+                if "Note" in data or "Information" in data:
+                    msg = data.get("Note") or data.get("Information") or "Rate limited / No data"
+                    if attempt < retry:
+                        await asyncio.sleep(backoff); backoff *= 2
+                        continue
+                    raise RuntimeError(f"Alpha Vantage: {msg}")
 
-            CACHE[cache_key] = (now + CACHE_TTL, data)
-            return data
+                # Sağlıklı veri: cache'le ve dön
+                CACHE[cache_key] = (now + CACHE_TTL, data)
+                return data
 
-        raise ValueError("API limit/temporary error")
+        raise ValueError("API temporary error after retries")
 
 async def load_fx_series(pair: str, term: str) -> Tuple[pd.DataFrame, bool]:
     """
@@ -168,7 +172,6 @@ async def load_fx_series(pair: str, term: str) -> Tuple[pd.DataFrame, bool]:
     fell_back = False
 
     if term == "kısa":
-        # try 60min first
         params = {
             "function": "FX_INTRADAY",
             "from_symbol": base,
@@ -178,10 +181,10 @@ async def load_fx_series(pair: str, term: str) -> Tuple[pd.DataFrame, bool]:
             "apikey": API_KEY,
         }
         key_name = "Time Series FX (60min)"
-        cache_key = f"FX_INTRADAY-{base}{quote}-60"
-        data = await fetch_json(params, cache_key)
+        data = await fetch_json(params, f"FX_INTRADAY-{base}{quote}-60")
+
         if key_name not in data:
-            # fallback to DAILY
+            # intraday yok → DAILY fallback
             fell_back = True
             params = {
                 "function": "FX_DAILY",
@@ -191,22 +194,20 @@ async def load_fx_series(pair: str, term: str) -> Tuple[pd.DataFrame, bool]:
                 "apikey": API_KEY,
             }
             key_name = "Time Series FX (Daily)"
-            cache_key = f"FX_DAILY-{base}{quote}-fallback"
-            data = await fetch_json(params, cache_key)
+            data = await fetch_json(params, f"FX_DAILY-{base}{quote}-fallback")
     elif term == "uzun":
         params = {"function": "FX_WEEKLY", "from_symbol": base, "to_symbol": quote, "apikey": API_KEY}
         key_name = "Time Series FX (Weekly)"
-        cache_key = f"FX_WEEKLY-{base}{quote}"
-        data = await fetch_json(params, cache_key)
+        data = await fetch_json(params, f"FX_WEEKLY-{base}{quote}")
     else:
         params = {"function": "FX_DAILY", "from_symbol": base, "to_symbol": quote, "outputsize": "compact", "apikey": API_KEY}
         key_name = "Time Series FX (Daily)"
-        cache_key = f"FX_DAILY-{base}{quote}"
-        data = await fetch_json(params, cache_key)
+        data = await fetch_json(params, f"FX_DAILY-{base}{quote}")
 
     ts = data.get(key_name)
     if not ts:
-        raise ValueError("API response missing time series")
+        # Teşhis kolaylığı için mevcut anahtarları göster
+        raise ValueError(f"Missing '{key_name}'. Available keys: {list(data.keys())[:5]}")
 
     df = (
         pd.DataFrame(ts)
@@ -237,6 +238,7 @@ def compute_indicators(df: pd.DataFrame, term: str) -> pd.DataFrame:
     rs = roll_up / roll_dn
     df["rsi"] = 100 - (100 / (1 + rs))
 
+    # Bollinger
     bb_p = 20
     ma = df["close"].rolling(bb_p).mean()
     std = df["close"].rolling(bb_p).std(ddof=0)
@@ -244,59 +246,53 @@ def compute_indicators(df: pd.DataFrame, term: str) -> pd.DataFrame:
     df["bb_up"] = ma + 2 * std
     df["bb_lo"] = ma - 2 * std
 
+    # ATR
     hl = df["high"] - df["low"]
     hc = (df["high"] - df["close"].shift()).abs()
     lc = (df["low"] - df["close"].shift()).abs()
     tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
     df["atr"] = tr.ewm(alpha=1/atr_p, adjust=False).mean()
+
     return df
 
-def evaluate_signal(row: pd.Series, prev_signal: str = "NÖTR") -> Tuple[str, Dict[str, float]]:
+def evaluate_signal(row: pd.Series, prev_signal: str = "NÖTR"):
     price, rsi, sma, ema, atr = row["close"], row["rsi"], row["sma"], row["ema"], row["atr"]
     bb_up, bb_lo = row["bb_up"], row["bb_lo"]
 
     if pd.isna([rsi, sma, ema, atr, bb_up, bb_lo]).any():
-        return prev_signal, {"score": 0.0}
+        return prev_signal, {"score": 0.0, "regime": float("nan")}
 
     regime = atr / price
     low_vol = regime < 0.005
     high_vol = regime > 0.02
 
     score = 0.0
-    parts = {}
 
-    trend = 1 if ema > sma else -1
-    parts["trend"] = trend * 1.5
-    score += parts["trend"]
+    # Trend (EMA vs SMA)
+    score += (1.5 if ema > sma else -1.5)
 
+    # RSI
     if rsi < 30:
-        parts["rsi"] = 1.0
+        score += 1.0
     elif rsi > 70:
-        parts["rsi"] = -1.0
-    else:
-        parts["rsi"] = 0.0
-    score += parts["rsi"]
+        score -= 1.0
 
+    # Bollinger dokunuşu
     if price < bb_lo:
-        parts["boll"] = 1.2 if low_vol else 0.6
+        score += (1.2 if low_vol else 0.6)
     elif price > bb_up:
-        parts["boll"] = -1.2 if low_vol else -0.6
-    else:
-        parts["boll"] = 0.0
-    score += parts["boll"]
+        score -= (1.2 if low_vol else 0.6)
 
-    parts["ema_rel"] = 0.6 if price > ema else -0.6
-    score += parts["ema_rel"]
+    # Fiyat EMA üstünde/altında
+    score += (0.6 if price > ema else -0.6)
 
-    parts["atr_pen"] = -0.6 if high_vol else 0.0
-    score += parts["atr_pen"]
+    # Çok yüksek volatilite penalize
+    if high_vol:
+        score -= 0.6
 
-    parts["score"] = round(score, 2)
-    parts["regime"] = float(regime)
-
-    # --- Histerezis (anti-flip) mantığı ---
+    # Histerezis
     upper, lower = 1.0, -1.0   # sinyal değişim sınırları
-    dead_zone = 0.5            # bu aralıkta önceki sinyal korunur
+    dead_zone = 0.5            # bu aralıkta nötr
 
     if score > upper:
         signal = "LONG"
@@ -305,19 +301,17 @@ def evaluate_signal(row: pd.Series, prev_signal: str = "NÖTR") -> Tuple[str, Di
     elif abs(score) <= dead_zone:
         signal = "NÖTR"
     else:
-        # ara bölgede: önceki sinyali koru
         signal = prev_signal
 
-    return signal, parts
+    return signal, {"score": round(score, 2), "regime": float(regime)}
 
-def adaptive_tp_sl(price: float, atr: float, signal: str, regime: float) -> Tuple[float,float]:
+def adaptive_tp_sl(price: float, atr: float, signal: str, regime: float) -> Tuple[float, float]:
     mult = 1.5 if regime < 0.005 else 2.0 if regime < 0.02 else 2.5
     if signal == "LONG":
         return round(price + mult*atr, 5), round(price - mult*atr, 5)
-    elif signal == "SHORT":
+    if signal == "SHORT":
         return round(price - mult*atr, 5), round(price + mult*atr, 5)
-    else:
-        return round(price + 2*atr, 5), round(price - 2*atr, 5)
+    return round(price + 2*atr, 5), round(price - 2*atr, 5)
 
 # ─────────── Bot Handlers ───────────
 async def select_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -328,48 +322,64 @@ async def select_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(i18n("tr")["choose_lang"], reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def handle_language_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
+    q = update.callback_query
+    await q.answer()
     if q.data == "lang_tr":
-        context.user_data["language"] = "tr"; await q.edit_message_text(i18n("tr")["lang_set_tr"])
+        context.user_data["language"] = "tr"
+        await q.edit_message_text(i18n("tr")["lang_set_tr"])
     else:
-        context.user_data["language"] = "en"; await q.edit_message_text(i18n("en")["lang_set_en"])
+        context.user_data["language"] = "en"
+        await q.edit_message_text(i18n("en")["lang_set_en"])
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    lang = context.user_data.get("language", "tr"); await update.message.reply_text(i18n(lang)["help"])
+    lang = context.user_data.get("language", "tr")
+    await update.message.reply_text(i18n(lang)["help"])
 
 async def start_forex(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_user_authorized(update):
-        await update.message.reply_text(i18n("tr")["no_access"]); return
+        await update.message.reply_text(i18n("tr")["no_access"])
+        return
+
     # abone kaydı
     subs = load_json(SUBSCRIBERS_FILE, {"chat_ids": []})
     if update.effective_chat.id not in subs["chat_ids"]:
-        subs["chat_ids"].append(update.effective_chat.id); save_json(SUBSCRIBERS_FILE, subs)
+        subs["chat_ids"].append(update.effective_chat.id)
+        save_json(SUBSCRIBERS_FILE, subs)
+
     lang = context.user_data.get("language", "tr")
     await update.message.reply_text(i18n(lang)["enter_pair"])
     context.user_data["awaiting_pair"] = True
 
 async def get_vade_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get("awaiting_pair"): return
+    if not context.user_data.get("awaiting_pair"):
+        return
     lang = context.user_data.get("language", "tr")
     pair = (update.message.text or "").upper().strip()
     if not parse_pair(pair):
-        await update.message.reply_text(i18n(lang)["bad_pair"]); return
-    context.user_data["pair"] = pair; context.user_data["awaiting_pair"] = False
+        await update.message.reply_text(i18n(lang)["bad_pair"])
+        return
+    context.user_data["pair"] = pair
+    context.user_data["awaiting_pair"] = False
     keyboard = [
         [InlineKeyboardButton("Kısa Vade" if lang=="tr" else "Short Term", callback_data="kısa")],
         [InlineKeyboardButton("Orta Vade" if lang=="tr" else "Medium Term", callback_data="orta")],
         [InlineKeyboardButton("Uzun Vade" if lang=="tr" else "Long Term", callback_data="uzun")],
     ]
-    await update.message.reply_text((f"İşlem çifti: {pair}\n" if lang=="tr" else f"Pair: {pair}\n")+i18n(lang)["pick_term"],
-                                    reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text(
+        (f"İşlem çifti: {pair}\n" if lang=="tr" else f"Pair: {pair}\n") + i18n(lang)["pick_term"],
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
 async def handle_vade_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    lang = context.user_data.get("language", "tr"); texts = i18n(lang)
+    q = update.callback_query
+    await q.answer()
+    lang = context.user_data.get("language", "tr")
+    texts = i18n(lang)
     await q.edit_message_text(texts["analyzing"])
     pair = context.user_data.get("pair")
     if not pair:
-        await q.edit_message_text("İşlem çifti bulunamadı. / Pair missing. /forex"); return
+        await q.edit_message_text("İşlem çifti bulunamadı. / Pair missing. /forex")
+        return
     term = q.data
     try:
         df, fell_back = await load_fx_series(pair, term)
@@ -389,11 +399,12 @@ async def handle_vade_selection(update: Update, context: ContextTypes.DEFAULT_TY
         ]
         if fell_back:
             lines.append(texts["bg_notice"])
-        lines.append(i18n(lang)["not_fin_advice"])
+        lines.append(texts["not_fin_advice"])
         await q.edit_message_text("\n".join(lines))
     except Exception as e:
         logger.exception("Analysis error")
-        await q.edit_message_text((i18n(lang)["analyzing"] if lang=="tr" else "Error: ") + str(e))
+        prefix = "Hata: " if lang=="tr" else "Error: "
+        await q.edit_message_text(prefix + str(e))
 
 # ─────────── Background Daemon ───────────
 async def signal_scanner(app: Application):
@@ -401,16 +412,19 @@ async def signal_scanner(app: Application):
     Sürekli çalışır. DEFAULT_PAIRS x DEFAULT_TERMS tarar.
     Sinyal değişimi gördüğünde tüm subscriber'lara bildirir.
     Cooldown: aynı pair-term için son push'tan sonra X dakika geçmeli.
+    Flip-flop: LONG→SHORT→LONG (ve tersi) hızlı dalgalanmayı engeller.
     """
     logger.info("Signal scanner started. Pairs=%s Terms=%s", DEFAULT_PAIRS, DEFAULT_TERMS)
     state = load_json(STATE_FILE, {})  # key: "PAIR|TERM"
+
     while True:
-        start = datetime.now(timezone.utc)
+        loop_start = datetime.now(timezone.utc)
         try:
             subs = load_json(SUBSCRIBERS_FILE, {"chat_ids": []}).get("chat_ids", [])
-            # yalnız kullanıcılar botu /start ile başlatmışsa mesaj gidebilir
             if not subs:
-                await asyncio.sleep(SCAN_INTERVAL_SEC); continue
+                # Abone yoksa bekle ve devam et
+                await asyncio.sleep(SCAN_INTERVAL_SEC)
+                continue
 
             for pair in DEFAULT_PAIRS:
                 for term in DEFAULT_TERMS:
@@ -419,29 +433,38 @@ async def signal_scanner(app: Application):
                         df, fell_back = await load_fx_series(pair, term)
                         df = compute_indicators(df, term)
                         last = df.iloc[-1]
-                        prev_sig = state.get(key, {}).get("last_signal", "NÖTR")
-                        signal, parts = evaluate_signal(last, prev_signal=prev_sig)
                         last_ts = last.name.isoformat()
-                        prev_ts = state.get(key, {}).get("last_ts")
+
+                        prev = state.get(key, {})
+                        prev_ts = prev.get("last_ts")
+
+                        # Aynı mum ise işlem yapma (state'i değiştirmeye gerek yok)
                         if last_ts == prev_ts:
-                         continue  # aynı mum, işlem yapma
+                            continue
+
+                        prev_sig = prev.get("last_signal", "NÖTR")
+                        signal, parts = evaluate_signal(last, prev_signal=prev_sig)
                         price, atr = float(last["close"]), float(last["atr"])
                         tp, sl = adaptive_tp_sl(price, atr, signal, parts["regime"])
-                        prev = state.get(key, {})
-                        prev_sig = prev.get("last_signal", "NÖTR")
+
+                        # Cooldown kontrolü
                         last_push_iso = prev.get("last_push")
                         cooldown_ok = True
                         if last_push_iso:
                             last_push = datetime.fromisoformat(last_push_iso)
-                            cooldown_ok = (
-                        signal != prev_sig or
-                        (start - last_push) > timedelta(minutes=SIGNAL_COOLDOWN_MIN)
+                            cooldown_ok = (signal != prev_sig) or (
+                                (loop_start - last_push) > timedelta(minutes=SIGNAL_COOLDOWN_MIN)
                             )
 
+                        # Flip-flop kontrolünü bildirim göndermeden ÖNCE yap
+                        prev_history = prev.get("history", [])
+                        candidate_history = (prev_history + [signal])[-3:]
+                        is_flipflop = candidate_history in (["LONG", "SHORT", "LONG"], ["SHORT", "LONG", "SHORT"])
 
-                        # yalnızca sinyal değişince ve cooldown uygunsa gönder
-                        changed = (signal != prev_sig) and (signal in ("LONG","SHORT"))
-                        if changed and cooldown_ok:
+                        changed = (signal != prev_sig) and (signal in ("LONG", "SHORT"))
+                        should_notify = changed and cooldown_ok and not is_flipflop
+
+                        if should_notify:
                             text = (
                                 f"📡 ForexGPT Sinyal\n"
                                 f"Parite: {pair} | Vade: {term.capitalize()} {'(DAILY fallback)' if fell_back else ''}\n"
@@ -452,38 +475,36 @@ async def signal_scanner(app: Application):
                                 f"ATR: {atr:.5f} (regime {parts['regime']:.4f}) | Score: {parts['score']}\n\n"
                                 f"⚠️ Yatırım tavsiyesi değildir."
                             )
-                            # toplu gönderim
                             for cid in subs:
                                 try:
                                     await app.bot.send_message(chat_id=cid, text=text)
                                 except Exception as send_err:
                                     logger.warning("send fail chat_id=%s err=%s", cid, send_err)
 
-                            # state güncelle
-                            prev_state = state.get(key, {})
-                            history = prev_state.get("history", [])
-                            history.append(signal)
-                            if len(history) > 3:
-                             history = history[-3:]
-
-                            # Eğer son 3 sinyal LONG→SHORT→LONG ya da tersi ise spam engelle
-                            if history in (["LONG","SHORT","LONG"], ["SHORT","LONG","SHORT"]):
-                             logger.info("Flip-flop detected for %s, skipping notification", key)
-                            continue
-
-                            state[key] = {
-                            "last_signal": signal,
-                            "last_ts": last.name.isoformat(),
-                            "last_push": start.isoformat(),
-                            "history": history
-                            }
-                        else:
-                            # sadece state'i güncel tut (push yok)
+                            # Bildirim atıldı → state'i güncelle
                             state[key] = {
                                 "last_signal": signal,
-                                "last_ts": last.name.isoformat(),
-                                "last_push": prev.get("last_push"),
+                                "last_ts": last_ts,
+                                "last_push": loop_start.isoformat(),
+                                "history": candidate_history,
                             }
+                            save_json(STATE_FILE, state)
+
+                        else:
+                            if is_flipflop:
+                                logger.info("Flip-flop detected for %s, skipping notification", key)
+                            # Bildirim yok → yine de state'i güncel tut
+                            state[key] = {
+                                "last_signal": signal,
+                                "last_ts": last_ts,
+                                "last_push": prev.get("last_push"),
+                                "history": candidate_history,
+                            }
+                            save_json(STATE_FILE, state)
+
+                        # (nazik) pacing: alpha limitlerine yaklaşmamak için küçük uyku
+                        await asyncio.sleep(1)
+
                     except Exception as pair_err:
                         logger.warning("scan error %s %s: %s", pair, term, pair_err)
                         await asyncio.sleep(1)
@@ -492,7 +513,7 @@ async def signal_scanner(app: Application):
             logger.exception("scanner loop error: %s", loop_err)
 
         # döngü bekleme
-        spent = (datetime.now(timezone.utc) - start).total_seconds()
+        spent = (datetime.now(timezone.utc) - loop_start).total_seconds()
         delay = max(5, SCAN_INTERVAL_SEC - int(spent))
         await asyncio.sleep(delay)
 

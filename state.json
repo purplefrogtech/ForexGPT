@@ -6,8 +6,11 @@
   },
   "EURUSD|orta": {
     "last_signal": "LONG",
-    "last_ts": "2025-10-28T00:00:00",
-    "last_push": "2025-10-29T09:35:02.109094+00:00"
+    "last_ts": "2025-10-29T00:00:00",
+    "last_push": "2025-10-29T09:35:02.109094+00:00",
+    "history": [
+      "LONG"
+    ]
   },
   "USDTRY|kısa": {
     "last_signal": "SHORT",
@@ -16,8 +19,11 @@
   },
   "USDTRY|orta": {
     "last_signal": "SHORT",
-    "last_ts": "2025-10-28T00:00:00",
-    "last_push": "2025-10-29T09:35:02.109094+00:00"
+    "last_ts": "2025-10-29T00:00:00",
+    "last_push": "2025-10-29T09:35:02.109094+00:00",
+    "history": [
+      "SHORT"
+    ]
   },
   "GBPUSD|kısa": {
     "last_signal": "SHORT",
@@ -26,7 +32,10 @@
   },
   "GBPUSD|orta": {
     "last_signal": "SHORT",
-    "last_ts": "2025-10-28T00:00:00",
-    "last_push": "2025-10-29T09:35:02.109094+00:00"
+    "last_ts": "2025-10-29T00:00:00",
+    "last_push": "2025-10-29T09:35:02.109094+00:00",
+    "history": [
+      "SHORT"
+    ]
   }
 }
